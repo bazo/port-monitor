@@ -1,0 +1,3 @@
+- [x] Update scanner struct to hold Connection objects (Port, Status)
+- [x] Update scanner logic to capture all connection types
+- [x] Update TUI to display Listen vs Established ports (Prioritize Listen in table)
