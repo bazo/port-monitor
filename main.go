@@ -31,12 +31,16 @@ var (
 
 	tabStyle = lipgloss.NewStyle().
 			Padding(0, 1).
-			Foreground(lipgloss.Color("240")).
+			Foreground(lipgloss.Color("252")).
 			Border(lipgloss.NormalBorder(), false, false, true, false)
 
 	activeTabStyle = tabStyle.Copy().
-			Foreground(lipgloss.Color("255")).
-			BorderForeground(lipgloss.Color("62"))
+			Foreground(lipgloss.Color("229")).
+			Background(lipgloss.Color("57")).
+			Bold(true).
+			BorderForeground(lipgloss.Color("62")) // Keep the bottom border color or remove it?
+		// Let's make it look like a real tab, maybe remove bottom border for active?
+		// For now, just better colors.
 )
 
 type tickMsg time.Time
@@ -162,7 +166,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.table.SetHeight(m.height - 12) // Increase margin to prevent overflow
+		m.table.SetHeight(m.height - 15) // Reserve extra space for header/footer/tabs
 		m.table.SetWidth(m.width - 4)    // Reserve minimal margin
 
 		// Calculate column widths
