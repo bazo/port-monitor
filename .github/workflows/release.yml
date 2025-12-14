@@ -1,0 +1,60 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build using Go ${{ matrix.go-version }} on ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ '1.23' ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build MacOS Silicon (ARM64)
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: go build -ldflags="-s -w" -o dist/ports_darwin_arm64 main.go
+
+      - name: Build Linux (AMD64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -ldflags="-s -w" -o dist/ports_linux_amd64 main.go
+
+      - name: Build Linux (ARM64)
+        env:
+          GOOS: linux
+          GOARCH: arm64
+        run: go build -ldflags="-s -w" -o dist/ports_linux_arm64 main.go
+
+      - name: Build Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -ldflags="-s -w" -o dist/ports_windows_amd64.exe main.go
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/ports_darwin_arm64
+            dist/ports_linux_amd64
+            dist/ports_linux_arm64
+            dist/ports_windows_amd64.exe
+          generate_release_notes: true

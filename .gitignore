@@ -1,2 +1,5 @@
 port-monitor
-tmp
+ports
+ports.exe
+dist/
+tmp/
