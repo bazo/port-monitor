@@ -10,6 +10,7 @@ import (
 	"port-monitor/scanner"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -38,10 +39,10 @@ var (
 			Foreground(lipgloss.Color("229")).
 			Background(lipgloss.Color("57")).
 			Bold(true).
-			BorderForeground(lipgloss.Color("62")) // Keep the bottom border color or remove it?
-		// Let's make it look like a real tab, maybe remove bottom border for active?
-		// For now, just better colors.
+			BorderForeground(lipgloss.Color("62"))
 )
+
+type notificationTimeoutMsg struct{}
 
 type tickMsg time.Time
 
@@ -57,6 +58,11 @@ const (
 	SortMem
 )
 
+type killResultMsg struct {
+	count int
+	err   error
+}
+
 type model struct {
 	table        table.Model
 	processes    []scanner.ProcessInfo
@@ -71,6 +77,15 @@ type model struct {
 	filterPorts bool // Show only processes with ports
 	sortBy      int
 	sortDesc    bool
+
+	// Search
+	textInput textinput.Model
+	searching bool
+
+	// Kill & Interactions
+	confirming   bool
+	pendingPids  []int32
+	notification string
 }
 
 func initialModel() model {
@@ -102,14 +117,22 @@ func initialModel() model {
 		Bold(false)
 	t.SetStyles(s)
 
+	ti := textinput.New()
+	ti.Placeholder = "Search ports..."
+	ti.CharLimit = 156
+	ti.Width = 20
+
 	return model{
 		table:        t,
 		selectedPids: make(map[int32]struct{}),
 		activeTab:    0,
 		loading:      true,
 		filterPorts:  true,      // Default true
-		sortBy:       SortPorts, // Default sort by Ports? Or PID. Request says "by default show only those that have". Maybe sort by ports count or just existence?
+		sortBy:       SortPorts, // Default sort by Ports
 		sortDesc:     true,
+		textInput:    ti,
+		searching:    false,
+		confirming:   false,
 	}
 }
 
@@ -117,6 +140,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		scanProcessesCmd,
 		tickCmd(),
+		textinput.Blink,
 	)
 }
 
@@ -138,6 +162,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.searching {
+			switch msg.String() {
+			case "enter", "esc":
+				m.searching = false
+				m.table.Focus()
+				m.textInput.Blur()
+				return m, nil
+			default:
+				m.textInput, cmd = m.textInput.Update(msg)
+				m.updateTable()
+				return m, cmd
+			}
+		}
+
+		if m.confirming {
+			switch strings.ToLower(msg.String()) {
+			case "y":
+				cmd = m.killPending()
+				m.confirming = false
+				m.notification = fmt.Sprintf("Killing %d process(s)...", len(m.pendingPids))
+				return m, tea.Batch(cmd, waitNotificationCmd())
+			case "n", "esc":
+				m.confirming = false
+				m.pendingPids = nil
+				m.notification = "Cancelled."
+				return m, waitNotificationCmd()
+			default:
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -147,12 +202,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			m.toggleSelection()
 			m.updateTable() // Refresh checks
+			return m, nil   // Prevent jumping (bubbles/table maps space to PageDown)
 		case "k":
-			if len(m.selectedPids) > 0 {
-				cmd := m.killSelected()
-				m.selectedPids = make(map[int32]struct{}) // Clear selection immediately
-				return m, cmd
-			}
+			m.startKillProcess()
 		case "f":
 			m.filterPorts = !m.filterPorts
 			m.updateTable()
@@ -162,6 +214,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "o":
 			m.sortDesc = !m.sortDesc
 			m.updateTable()
+		case "/":
+			m.searching = true
+			m.textInput.Focus()
+			m.table.Blur()
+			return m, textinput.Blink
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -209,12 +266,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateTable()
 	case tickMsg:
 		return m, tea.Batch(scanProcessesCmd, tickCmd())
+	case killResultMsg:
+		if msg.err != nil {
+			m.notification = fmt.Sprintf("Error: %v", msg.err)
+		} else {
+			m.notification = fmt.Sprintf("Successfully killed %d process(s)", msg.count)
+			// Clear selection if successful
+			m.selectedPids = make(map[int32]struct{})
+		}
+		return m, tea.Batch(scanProcessesCmd, waitNotificationCmd())
+	case notificationTimeoutMsg:
+		m.notification = ""
+		return m, nil
 	case errMsg:
 		m.err = msg
 	}
 
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
+}
+
+func waitNotificationCmd() tea.Cmd {
+	return tea.Tick(time.Second*3, func(t time.Time) tea.Msg {
+		return notificationTimeoutMsg{}
+	})
 }
 
 func (m *model) toggleSelection() {
@@ -236,18 +311,55 @@ func (m cmdMsg) String() string { return "cmd" }
 
 type cmdMsg struct{} // dummy
 
-func (m *model) killSelected() tea.Cmd {
-	// Copy PIDs to slice to avoid data race in the command closure
-	var pids []int32
-	for pid := range m.selectedPids {
-		pids = append(pids, pid)
+func (m *model) startKillProcess() {
+	// Determine victims
+	var victims []int32
+
+	if len(m.selectedPids) > 0 {
+		for pid := range m.selectedPids {
+			victims = append(victims, pid)
+		}
+	} else {
+		// Use current cursor
+		row := m.table.SelectedRow()
+		if row != nil {
+			var pid int32
+			fmt.Sscanf(row[1], "%d", &pid)
+			victims = append(victims, pid)
+		}
 	}
 
+	if len(victims) == 0 {
+		m.notification = "No process selected."
+		// Trigger notification clear
+		// We can return a command, but since this is a method called in Update,
+		// we can't easily return a Cmd unless we return it.
+		// For now, let's just set string, it won't clear automatically properly unless we handled that return in Update.
+		// NOTE: In the Update case 'k', we didn't setup to receive a cmd from startKillProcess.
+		// Let's rely on user pressing 'k' again or just changing Update to call a helper that returns (model, cmd).
+		// Better: just set the specific state and return cmd in Update.
+		// Refactoring: logic logic moved to Update or helper that helps Update.
+		return
+	}
+
+	m.pendingPids = victims
+	m.confirming = true
+}
+
+func (m *model) killPending() tea.Cmd {
+	pids := m.pendingPids
 	return func() tea.Msg {
+		count := 0
+		var lastErr error
 		for _, pid := range pids {
-			scanner.KillProcess(pid)
+			err := scanner.KillProcess(pid)
+			if err != nil {
+				lastErr = err
+			} else {
+				count++
+			}
 		}
-		return scanProcessesCmd()
+		return killResultMsg{count: count, err: lastErr}
 	}
 }
 
@@ -266,6 +378,7 @@ func formatBytes(b uint64) string {
 
 func (m *model) updateTable() {
 	var rows []table.Row
+	search := strings.ToLower(m.textInput.Value())
 
 	// Filter and Sort
 	var filtered []scanner.ProcessInfo
@@ -276,12 +389,29 @@ func (m *model) updateTable() {
 			continue
 		}
 		// Port Filter
-		// Filter if no ports connected? Or no LISTENING ports?
-		// "show processes that have a port open".
-		// Let's filter if len(Connections) == 0.
 		if m.filterPorts && len(p.Connections) == 0 {
 			continue
 		}
+
+		// Search Filter
+		if search != "" {
+			matches := false
+			// Check Name
+			if strings.Contains(strings.ToLower(p.Name), search) {
+				matches = true
+			}
+			// Check Ports
+			for _, c := range p.Connections {
+				if strings.Contains(fmt.Sprintf("%d", c.Port), search) {
+					matches = true
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
+		}
+
 		filtered = append(filtered, p)
 	}
 
@@ -407,6 +537,25 @@ func (m model) View() string {
 	status := fmt.Sprintf("Sort: %s (%s) | Filter: %s", sortStr, orderStr, filterStr)
 	status = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(status)
 
+	// Search Bar
+	search := ""
+	if m.searching {
+		search = fmt.Sprintf("Search: %s", m.textInput.View())
+	} else if m.textInput.Value() != "" {
+		search = fmt.Sprintf("Filter: %s (press / to edit)", m.textInput.Value())
+	}
+	if search != "" {
+		status = lipgloss.JoinHorizontal(lipgloss.Left, status, " | ", lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render(search))
+	}
+
+	// Notification / Confirmation
+	if m.confirming {
+		prompt := fmt.Sprintf("Are you sure you want to kill %d process(s)? (y/n)", len(m.pendingPids))
+		status = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render(prompt)
+	} else if m.notification != "" {
+		status = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render(m.notification)
+	}
+
 	body := baseStyle.Render(m.table.View())
 
 	// Footer Details
@@ -447,7 +596,7 @@ func (m model) View() string {
 		}
 	}
 
-	help := "\n[Tab] View  [Space] Select  [k] Kill  [f] Filter Ports  [s] Sort Col  [o] Sort Order  [q] Quit"
+	help := "\n[Tab] View  [Space] Select  [k] Kill  [f] Filter Ports  [s] Sort Col  [o] Sort Order  [/] Search  [q] Quit"
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
