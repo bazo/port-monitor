@@ -9,6 +9,7 @@ import (
 
 	"port-monitor/scanner"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -48,6 +49,8 @@ type tickMsg time.Time
 
 type scanMsg []scanner.ProcessInfo
 
+type scanStartMsg struct{}
+
 type errMsg error
 
 const (
@@ -72,6 +75,7 @@ type model struct {
 	width        int
 	height       int
 	loading      bool
+	spinner      spinner.Model
 
 	// New State
 	filterPorts bool // Show only processes with ports
@@ -86,6 +90,13 @@ type model struct {
 	confirming   bool
 	pendingPids  []int32
 	notification string
+}
+
+func newSpinnerModel() spinner.Model {
+	s := spinner.New()
+	s.Spinner = spinner.MiniDot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("62"))
+	return s
 }
 
 func initialModel() model {
@@ -127,6 +138,7 @@ func initialModel() model {
 		selectedPids: make(map[int32]struct{}),
 		activeTab:    0,
 		loading:      true,
+		spinner:      newSpinnerModel(),
 		filterPorts:  true,      // Default true
 		sortBy:       SortPorts, // Default sort by Ports
 		sortDesc:     true,
@@ -138,18 +150,23 @@ func initialModel() model {
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		scanProcessesCmd,
+		scanProcessesCmd(),
 		tickCmd(),
 		textinput.Blink,
 	)
 }
 
-func scanProcessesCmd() tea.Msg {
-	procs, err := scanner.ScanProcesses()
-	if err != nil {
-		return errMsg(err)
-	}
-	return scanMsg(procs)
+func scanProcessesCmd() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg { return scanStartMsg{} },
+		func() tea.Msg {
+			procs, err := scanner.ScanProcesses()
+			if err != nil {
+				return errMsg(err)
+			}
+			return scanMsg(procs)
+		},
+	)
 }
 
 func tickCmd() tea.Cmd {
@@ -160,6 +177,11 @@ func tickCmd() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+	var spinnerCmd tea.Cmd
+	if m.loading {
+		m.spinner, spinnerCmd = m.spinner.Update(msg)
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if m.searching {
@@ -168,11 +190,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searching = false
 				m.table.Focus()
 				m.textInput.Blur()
-				return m, nil
+				return m, spinnerCmd
 			default:
 				m.textInput, cmd = m.textInput.Update(msg)
 				m.updateTable()
-				return m, cmd
+				return m, tea.Batch(cmd, spinnerCmd)
 			}
 		}
 
@@ -182,14 +204,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd = m.killPending()
 				m.confirming = false
 				m.notification = fmt.Sprintf("Killing %d process(s)...", len(m.pendingPids))
-				return m, tea.Batch(cmd, waitNotificationCmd())
+				return m, tea.Batch(cmd, waitNotificationCmd(), spinnerCmd)
 			case "n", "esc":
 				m.confirming = false
 				m.pendingPids = nil
 				m.notification = "Cancelled."
-				return m, waitNotificationCmd()
+				return m, tea.Batch(waitNotificationCmd(), spinnerCmd)
 			default:
-				return m, nil
+				return m, spinnerCmd
 			}
 		}
 
@@ -202,7 +224,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			m.toggleSelection()
 			m.updateTable() // Refresh checks
-			return m, nil   // Prevent jumping (bubbles/table maps space to PageDown)
+			return m, spinnerCmd // Prevent jumping (bubbles/table maps space to PageDown)
 		case "k":
 			m.startKillProcess()
 		case "f":
@@ -218,7 +240,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.searching = true
 			m.textInput.Focus()
 			m.table.Blur()
-			return m, textinput.Blink
+			return m, tea.Batch(textinput.Blink, spinnerCmd)
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -256,12 +278,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			{Title: "Type", Width: 8},
 		}
 		m.table.SetColumns(columns)
+	case scanStartMsg:
+		m.loading = true
+		m.spinner = newSpinnerModel()
+		return m, m.spinner.Tick
 	case scanMsg:
 		m.processes = msg
 		m.loading = false
 		m.updateTable()
 	case tickMsg:
-		return m, tea.Batch(scanProcessesCmd, tickCmd())
+		return m, tea.Batch(scanProcessesCmd(), tickCmd(), spinnerCmd)
 	case killResultMsg:
 		if msg.err != nil {
 			m.notification = fmt.Sprintf("Error: %v", msg.err)
@@ -270,16 +296,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Clear selection if successful
 			m.selectedPids = make(map[int32]struct{})
 		}
-		return m, tea.Batch(scanProcessesCmd, waitNotificationCmd())
+		return m, tea.Batch(scanProcessesCmd(), waitNotificationCmd(), spinnerCmd)
 	case notificationTimeoutMsg:
 		m.notification = ""
-		return m, nil
+		return m, spinnerCmd
 	case errMsg:
 		m.err = msg
 	}
 
 	m.table, cmd = m.table.Update(msg)
-	return m, cmd
+	return m, tea.Batch(cmd, spinnerCmd)
 }
 
 func waitNotificationCmd() tea.Cmd {
@@ -550,6 +576,9 @@ func (m model) View() string {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true).Render(prompt)
 	} else if m.notification != "" {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render(m.notification)
+	} else if m.loading {
+		loading := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render(fmt.Sprintf("%s Loading processes…", m.spinner.View()))
+		status = lipgloss.JoinHorizontal(lipgloss.Left, loading, "  ", status)
 	}
 
 	body := baseStyle.Render(m.table.View())
