@@ -224,31 +224,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.table.SetHeight(m.height - 15) // Reserve extra space for header/footer/tabs
-		m.table.SetWidth(m.width - 4)    // Reserve minimal margin
+
+		// Reserve margin for borders (2 for outer border, plus extra safety)
+		tableWidth := m.width - 4
+		m.table.SetWidth(tableWidth)
 
 		// Calculate column widths
 		// Fixed: X(2), PID(8), CPU(6), Mem(10), Type(8) -> Total 34
-		// Table container has 2px border (from baseStyle)
-		// So available space for columns is (width - 4)
-		effectiveWidth := m.width - 4
-
 		fixedWidths := 34
-		avail := effectiveWidth - fixedWidths
-		if avail < 35 {
-			avail = 35 // Minimum for Name+Ports
+		avail := tableWidth - fixedWidths
+		if avail < 0 {
+			avail = 0
 		}
 
-		// Distribute remainder
-		// Name gets ~40%, Ports gets ~60%
+		// Distribute remainder: Name ~40%, Ports ~60%
 		nameW := int(float64(avail) * 0.4)
-		if nameW < 20 {
-			nameW = 20
+		// Ensure name matches minimum usability if possible, but prioritized fitting
+		if nameW < 10 && avail >= 10 {
+			nameW = 10
 		}
 
 		portsW := avail - nameW
-		if portsW < 15 {
-			portsW = 15
-		}
 
 		columns := []table.Column{
 			{Title: "X", Width: 2},
