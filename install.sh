@@ -47,7 +47,14 @@ echo "Asset Suffix: $ASSET_SUFFIX"
 # --- Get Latest Release ---
 echo "Fetching latest release info..."
 LATEST_RELEASE_URL="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
-DOWNLOAD_URL=$(curl -s $LATEST_RELEASE_URL | grep "browser_download_url.*$ASSET_SUFFIX" | cut -d : -f 2,3 | tr -d \")
+DOWNLOAD_URL=$(
+    curl -s "$LATEST_RELEASE_URL" \
+        | grep -m1 "browser_download_url.*$ASSET_SUFFIX" \
+        | cut -d : -f 2,3 \
+        | tr -d '"' \
+        | tr -d ',' \
+        | xargs
+)
 
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "Error: Could not find a release asset for $ASSET_SUFFIX in $REPO_OWNER/$REPO_NAME"
