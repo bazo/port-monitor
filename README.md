@@ -11,6 +11,16 @@ A TUI application to monitor processes and their ports.
 - **Sorting**: Sort by PID, Name, Ports, CPU, or Memory.
 - **Resource Usage**: Monitor CPU and Memory consumption.
 
+## Installation
+
+You can install `ports` easily using the install script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bazo/port-monitor/main/install.sh | bash
+```
+
+Or you can download the binary for your system from the [Releases](https://github.com/bazo/port-monitor/releases) page.
+
 ## Usage
 
 Run the application:
